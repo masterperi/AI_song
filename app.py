@@ -5,6 +5,11 @@ import tempfile
 import os
 from io import BytesIO
 import base64
+import pyttsx3
+import threading
+from gtts import gTTS
+import pygame
+import time
 
 # Page configuration
 st.set_page_config(
@@ -37,11 +42,19 @@ st.markdown("""
         padding: 1rem;
         border-radius: 8px;
         margin: 1rem 0;
+        color: #111; /* <-- Add this line for black text */
     }
     .audio-section {
         background: #e8f4fd;
         padding: 1.5rem;
         border-radius: 10px;
+        margin: 1rem 0;
+    }
+    .audio-player {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #ddd;
         margin: 1rem 0;
     }
 </style>
@@ -52,17 +65,58 @@ if 'model' not in st.session_state:
     st.session_state.model = None
     st.session_state.tokenizer = None
     st.session_state.model_loaded = False
+    st.session_state.tts_engine = None
+    st.session_state.audio_generated = False
+
+# Initialize pygame mixer for audio playback
+try:
+    pygame.mixer.init()
+except:
+    pass
 
 @st.cache_resource
 def load_model():
-    """Load the Granite model and tokenizer"""
+    """Load the Granite model with memory optimization"""
     try:
-        tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.3-2b-instruct")
-        model = AutoModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-2b-instruct")
+        # Memory optimization settings
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            "ibm-granite/granite-3.3-2b-instruct",
+            torch_dtype=torch.float16,  # Use half precision to save memory
+            low_cpu_mem_usage=True      # Load model with less memory usage
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            "ibm-granite/granite-3.3-2b-instruct",
+            torch_dtype=torch.float16,  # Half precision
+            low_cpu_mem_usage=True,     # Memory efficient loading
+            device_map="auto"           # Automatically handle device placement
+        )
+        
         return tokenizer, model, True
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
+        st.error(f"Error loading Granite model: {str(e)}")
+        st.info("Try increasing your virtual memory (paging file) in Windows settings")
         return None, None, False
+
+@st.cache_resource
+def initialize_tts_engine():
+    """Initialize the local TTS engine"""
+    try:
+        engine = pyttsx3.init()
+        
+        # Get available voices
+        voices = engine.getProperty('voices')
+        
+        # Set default properties
+        engine.setProperty('rate', 180)    # Speed of speech
+        engine.setProperty('volume', 0.9)  # Volume level (0.0 to 1.0)
+        
+        return engine, voices
+    except Exception as e:
+        st.error(f"Error initializing TTS engine: {str(e)}")
+        return None, None
 
 def rewrite_text_with_tone(text, tone, tokenizer, model):
     """Rewrite text with specified tone using Granite model"""
@@ -85,16 +139,21 @@ def rewrite_text_with_tone(text, tone, tokenizer, model):
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-        ).to(model.device)
+        )
         
-        # Generate with appropriate parameters
+        # Move to appropriate device
+        if torch.cuda.is_available():
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        # Generate with memory optimization
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, 
-                max_new_tokens=min(len(text) * 2, 500),  # Adaptive length based on input
+                max_new_tokens=min(len(text) * 2, 400),  # Reduced for memory
                 temperature=0.7,
                 do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=True  # Enable caching for efficiency
             )
         
         # Decode the generated text
@@ -109,27 +168,87 @@ def rewrite_text_with_tone(text, tone, tokenizer, model):
         st.error(f"Error rewriting text: {str(e)}")
         return text
 
-def create_audio_placeholder(text, voice):
-    """Create a placeholder for audio generation (replace with actual TTS)"""
-    # This is a placeholder function. In a real implementation, you would:
-    # 1. Use IBM Watson Text-to-Speech API
-    # 2. Generate actual audio file
-    # 3. Return the audio file path or bytes
-    
-    audio_info = {
-        "text_length": len(text),
-        "voice": voice,
-        "estimated_duration": len(text.split()) * 0.5,  # Rough estimate
-        "format": "mp3"
-    }
-    
-    return audio_info
+def generate_audio_pyttsx3(text, voice_id, rate=180):
+    """Generate audio using pyttsx3 (offline TTS)"""
+    try:
+        if st.session_state.tts_engine is None:
+            engine, voices = initialize_tts_engine()
+            st.session_state.tts_engine = engine
+            st.session_state.available_voices = voices
+        
+        engine = st.session_state.tts_engine
+        voices = st.session_state.available_voices
+        
+        # Set voice
+        if voices and voice_id < len(voices):
+            engine.setProperty('voice', voices[voice_id].id)
+        
+        # Set rate
+        engine.setProperty('rate', rate)
+        
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        # Save audio to file
+        engine.save_to_file(text, temp_path)
+        engine.runAndWait()
+        
+        return temp_path
+    except Exception as e:
+        st.error(f"Error generating audio with pyttsx3: {str(e)}")
+        return None
 
-def get_download_link(text, filename):
+def generate_audio_gtts(text, lang='en', slow=False):
+    """Generate audio using gTTS (requires internet for first use)"""
+    try:
+        # Create gTTS object
+        tts = gTTS(text=text, lang=lang, slow=slow)
+        
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        # Save audio to file
+        tts.save(temp_path)
+        
+        return temp_path
+    except Exception as e:
+        st.error(f"Error generating audio with gTTS: {str(e)}")
+        st.info("Note: gTTS requires internet connection. Using offline pyttsx3 instead.")
+        return None
+
+def get_download_link(file_path, filename):
+    """Generate download link for audio file"""
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        
+        b64 = base64.b64encode(data).decode()
+        href = f'<a href="data:audio/wav;base64,{b64}" download="{filename}">📥 Download {filename}</a>'
+        return href
+    except Exception as e:
+        st.error(f"Error creating download link: {str(e)}")
+        return ""
+
+def get_text_download_link(text, filename):
     """Generate download link for text file"""
     b64 = base64.b64encode(text.encode()).decode()
-    href = f'<a href="data:text/plain;base64,{b64}" download="{filename}">Download {filename}</a>'
+    href = f'<a href="data:text/plain;base64,{b64}" download="{filename}">📄 Download {filename}</a>'
     return href
+
+# Sample texts
+sample_texts = {
+    "Educational": "Photosynthesis is the process by which plants convert sunlight into energy. During this remarkable biological process, plants absorb carbon dioxide from the atmosphere and water from their roots. Using chlorophyll as a catalyst, they transform these simple ingredients into glucose and oxygen. This process not only feeds the plant but also produces the oxygen that most life on Earth depends upon.",
+    
+    "Mystery": "Detective Martinez examined the crime scene with careful precision. The antique clock had stopped at exactly midnight, and a single red rose lay on the mahogany desk. Three suspects had alibis, but something didn't add up. As she studied the evidence, a peculiar detail caught her attention - a barely visible footprint in the dust that shouldn't have been there.",
+    
+    "Motivational": "Success is not about avoiding failure, but about learning from every setback. Each challenge you face is an opportunity to grow stronger and wiser. Remember that every champion was once a beginner who refused to give up. Your dreams are valid, your efforts matter, and your persistence will pay off.",
+    
+    "Business": "Effective teamwork requires clear communication, shared goals, and mutual respect. In today's global marketplace, diverse teams bring unique perspectives that drive innovation. Companies that foster collaborative environments see improved productivity and employee satisfaction."
+}
 
 # Main UI
 def main():
@@ -143,22 +262,33 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙ Configuration")
+        st.header("⚙️ Configuration")
         
         # Model loading section
-        st.subheader("Model Status")
+        st.subheader("🚀 Model Setup")
         if not st.session_state.model_loaded:
+            st.info("IBM Granite 3.3 2B Instruct Model (~4-5GB)")
+            st.warning("⚠️ Large model - ensure 8GB+ RAM available")
             if st.button("🚀 Load Granite Model", type="primary"):
-                with st.spinner("Loading AI model..."):
+                with st.spinner("Loading IBM Granite model... (5-10 minutes)"):
                     tokenizer, model, success = load_model()
                     if success:
                         st.session_state.tokenizer = tokenizer
                         st.session_state.model = model
                         st.session_state.model_loaded = True
-                        st.success("✅ Model loaded successfully!")
+                        st.success("✅ Granite model loaded successfully!")
+                        st.balloons()
                         st.rerun()
         else:
-            st.success("✅ Model ready")
+            st.success("✅ Granite Model Ready")
+        
+        # TTS Engine selection
+        st.subheader("🎤 Text-to-Speech Engine")
+        tts_engine = st.radio(
+            "Choose TTS engine:",
+            ["pyttsx3 (Offline)", "gTTS (Online)"],
+            help="pyttsx3 works offline but has limited voices. gTTS requires internet but sounds more natural."
+        )
         
         # Tone selection
         st.subheader("🎭 Tone Selection")
@@ -168,13 +298,23 @@ def main():
             help="Select how you want your text to be rewritten"
         )
         
-        # Voice selection
-        st.subheader("🎤 Voice Selection")
-        voice = st.selectbox(
-            "Choose narrator voice:",
-            ["Lisa", "Michael", "Allison"],
-            help="Select the voice for text-to-speech conversion"
-        )
+        # Voice/Speed settings
+        st.subheader("🎛️ Audio Settings")
+        if tts_engine == "pyttsx3 (Offline)":
+            # Initialize TTS to get available voices
+            if st.session_state.tts_engine is None:
+                engine, voices = initialize_tts_engine()
+                st.session_state.tts_engine = engine
+                st.session_state.available_voices = voices
+            
+            voices = st.session_state.available_voices if st.session_state.available_voices else []
+            voice_names = [f"Voice {i}: {v.name[:30]}" for i, v in enumerate(voices)] if voices else ["Default Voice"]
+            
+            voice_index = st.selectbox("Select voice:", range(len(voice_names)), format_func=lambda x: voice_names[x])
+            speech_rate = st.slider("Speech rate:", 100, 300, 180, help="Words per minute")
+        else:
+            language = st.selectbox("Language:", ["en", "en-us", "en-uk", "en-au"], index=0)
+            slow_speech = st.checkbox("Slow speech", value=False)
         
         # Tone descriptions
         st.subheader("📝 Tone Guide")
@@ -186,9 +326,14 @@ def main():
         
         for t, desc in tone_descriptions.items():
             if t == tone:
-                st.markdown(f"{t}: {desc}")
+                st.markdown(f"**{t}**: {desc}")
             else:
                 st.markdown(f"{t}: {desc}")
+    
+    # Sample text selection
+    st.header("📝 Sample Texts")
+    
+    selected_sample = st.selectbox("Choose a sample text:", ["Custom"] + list(sample_texts.keys()))
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -206,8 +351,14 @@ def main():
         original_text = ""
         
         if input_method == "Paste Text":
+            if selected_sample != "Custom":
+                default_text = sample_texts[selected_sample]
+            else:
+                default_text = ""
+                
             original_text = st.text_area(
                 "Enter your text:",
+                value=default_text,
                 height=300,
                 placeholder="Paste your text here...",
                 help="Enter the text you want to convert to audiobook"
@@ -233,7 +384,7 @@ def main():
         
         if original_text and st.session_state.model_loaded:
             if st.button("🔄 Rewrite with Selected Tone", type="primary"):
-                with st.spinner(f"Rewriting text with {tone} tone..."):
+                with st.spinner(f"Rewriting text with {tone} tone using Granite model..."):
                     rewritten_text = rewrite_text_with_tone(
                         original_text, 
                         tone, 
@@ -242,6 +393,7 @@ def main():
                     )
                     st.session_state.rewritten_text = rewritten_text
                     st.session_state.current_tone = tone
+                    st.session_state.audio_generated = False  # Reset audio flag
             
             # Display rewritten text
             if hasattr(st.session_state, 'rewritten_text'):
@@ -254,7 +406,7 @@ def main():
                 
                 # Download option for rewritten text
                 st.markdown(
-                    get_download_link(
+                    get_text_download_link(
                         st.session_state.rewritten_text, 
                         f"rewritten_{st.session_state.current_tone.lower()}.txt"
                     ), 
@@ -262,7 +414,7 @@ def main():
                 )
         
         elif not st.session_state.model_loaded:
-            st.info("Please load the AI model first using the sidebar.")
+            st.info("Please load the Granite model first using the sidebar.")
         else:
             st.info("Please enter some text to rewrite.")
     
@@ -290,47 +442,109 @@ def main():
         audio_col1, audio_col2 = st.columns([2, 1])
         
         with audio_col1:
-            if st.button("🎧 Generate Audiobook", type="primary", use_container_width=True):
-                with st.spinner(f"Generating audio with {voice} voice..."):
-                    # Placeholder for audio generation
-                    audio_info = create_audio_placeholder(st.session_state.rewritten_text, voice)
-                    st.session_state.audio_info = audio_info
+            st.subheader("📊 Text Analysis")
+            text = st.session_state.rewritten_text
+            word_count = len(text.split())
+            char_count = len(text)
+            
+            if tts_engine == "pyttsx3 (Offline)":
+                estimated_duration = word_count / (speech_rate / 60)  # Based on WPM
+            else:
+                estimated_duration = word_count * 0.5  # Rough estimate
+            
+            st.write(f"**TTS Engine:** {tts_engine}")
+            st.write(f"**Tone:** {st.session_state.current_tone}")
+            st.write(f"**Word Count:** {word_count} words")
+            st.write(f"**Character Count:** {char_count} characters")
+            st.write(f"**Estimated Duration:** ~{estimated_duration:.1f} seconds ({estimated_duration/60:.1f} minutes)")
+            
+            # Generate audio button
+            if st.button("🎤 Generate Audio", type="primary"):
+                with st.spinner("Generating audio... This may take a moment..."):
+                    if tts_engine == "pyttsx3 (Offline)":
+                        audio_path = generate_audio_pyttsx3(text, voice_index, speech_rate)
+                    else:
+                        audio_path = generate_audio_gtts(text, language, slow_speech)
                     
-                    # In a real implementation, you would generate actual audio here
-                    st.success("✅ Audio generated successfully!")
-                    st.info("📝 Note: This is a demo. In production, actual audio would be generated using IBM Watson Text-to-Speech.")
+                    if audio_path:
+                        st.session_state.audio_path = audio_path
+                        st.session_state.audio_generated = True
+                        st.success("✅ Audio generated successfully!")
+                    else:
+                        st.error("❌ Failed to generate audio. Please try again.")
         
         with audio_col2:
-            if hasattr(st.session_state, 'audio_info'):
-                st.subheader("📊 Audio Details")
-                info = st.session_state.audio_info
-                st.write(f"*Voice:* {info['voice']}")
-                st.write(f"*Duration:* ~{info['estimated_duration']:.1f}s")
-                st.write(f"*Format:* {info['format'].upper()}")
-                st.write(f"*Text Length:* {info['text_length']} chars")
-        
-        # Audio playback placeholder
-        if hasattr(st.session_state, 'audio_info'):
-            st.subheader("🎵 Audio Playback")
-            st.info("🔊 Audio player would appear here in the full implementation")
+            st.subheader("🎛️ Current Settings")
             
-            # Download button placeholder
-            st.download_button(
-                label="📥 Download MP3 (Demo)",
-                data="This would be audio file bytes in real implementation",
-                file_name=f"audiobook_{st.session_state.current_tone.lower()}_{voice.lower()}.mp3",
-                mime="audio/mpeg",
-                help="Download the generated audiobook"
-            )
+            if tts_engine == "pyttsx3 (Offline)":
+                st.write(f"**Voice:** {voice_names[voice_index] if 'voice_names' in locals() else 'Default'}")
+                st.write(f"**Speech Rate:** {speech_rate} WPM")
+            else:
+                st.write(f"**Language:** {language}")
+                st.write(f"**Slow Speech:** {'Yes' if slow_speech else 'No'}")
+        
+        # Audio player section
+        if hasattr(st.session_state, 'audio_generated') and st.session_state.audio_generated:
+            st.markdown('<div class="audio-player">', unsafe_allow_html=True)
+            st.subheader("🎧 Generated Audiobook")
+            
+            try:
+                # Display audio player
+                with open(st.session_state.audio_path, 'rb') as audio_file:
+                    audio_bytes = audio_file.read()
+                    st.audio(audio_bytes, format='audio/wav' if tts_engine == "pyttsx3 (Offline)" else 'audio/mp3')
+                
+                # Download button
+                filename = f"audiobook_{st.session_state.current_tone.lower()}.{'wav' if tts_engine == 'pyttsx3 (Offline)' else 'mp3'}"
+                st.markdown(
+                    get_download_link(st.session_state.audio_path, filename),
+                    unsafe_allow_html=True
+                )
+                
+                # File info
+                file_size = os.path.getsize(st.session_state.audio_path) / 1024 / 1024  # MB
+                st.write(f"**File size:** {file_size:.2f} MB")
+                
+            except Exception as e:
+                st.error(f"Error displaying audio: {str(e)}")
+            
+            st.markdown('</div>', unsafe_allow_html=True)
         
         st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Installation guide
+    with st.expander("🛠️ Installation Requirements"):
+        st.markdown("""
+        **Required packages for local TTS:**
+        
+        ```bash
+        pip install pyttsx3 gtts pygame
+        ```
+        
+        **For pyttsx3 (offline TTS):**
+        - Works completely offline
+        - Uses system TTS voices
+        - Fast generation
+        - Platform-specific voices (Windows SAPI, macOS NSSpeechSynthesizer, Linux espeak)
+        
+        **For gTTS (Google TTS):**
+        - Requires internet connection
+        - High-quality, natural voices
+        - Supports multiple languages
+        - Slower generation due to API calls
+        
+        **System Requirements:**
+        - Python 3.7+
+        - For GPU acceleration: CUDA-compatible GPU with 4GB+ VRAM
+        - RAM: 8GB+ recommended for Granite model
+        """)
     
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: #666;">
         <p>🎧 EchoVerse - Making content accessible through AI-powered audiobook creation</p>
-        <p><small>Powered by IBM Granite 3.3 2B Instruct Model</small></p>
+        <p><small>Powered by IBM Granite 3.3 2B Instruct Model + Local Text-to-Speech</small></p>
     </div>
     """, unsafe_allow_html=True)
 
